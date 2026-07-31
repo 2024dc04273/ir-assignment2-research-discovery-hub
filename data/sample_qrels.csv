@@ -1,0 +1,20 @@
+query,url,relevance
+information retrieval,https://demo.irhub.local/information-retrieval-basics,3
+information retrieval,https://demo.irhub.local/bm25-ranking,2
+information retrieval,https://demo.irhub.local/evaluation-metrics,2
+information retrieval,https://demo.irhub.local/query-optimization,2
+information retrieval,https://demo.irhub.local/semantic-search,1
+bm25 ranking,https://demo.irhub.local/bm25-ranking,3
+bm25 ranking,https://demo.irhub.local/ranking-diagnostics,3
+bm25 ranking,https://demo.irhub.local/pagerank-authority,2
+bm25 ranking,https://demo.irhub.local/query-optimization,2
+duplicate,https://demo.irhub.local/deduplication,3
+duplicate,https://demo.irhub.local/web-crawling,2
+duplicate,https://demo.irhub.local/data-pipelines,2
+recommendation similarity,https://demo.irhub.local/tfidf-content-recommender,3
+recommendation similarity,https://demo.irhub.local/collaborative-recommender,3
+recommendation similarity,https://demo.irhub.local/text-preprocessing,2
+ranking,https://demo.irhub.local/bm25-ranking,3
+ranking,https://demo.irhub.local/ranking-diagnostics,3
+ranking,https://demo.irhub.local/query-optimization,2
+ranking,https://demo.irhub.local/evaluation-metrics,1
