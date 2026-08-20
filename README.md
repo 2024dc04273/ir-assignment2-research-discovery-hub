@@ -24,7 +24,17 @@ Open the local address Streamlit prints. No separate backend command is required
 5. In **Evaluation**, leave “Use supplied demo relevance judgments” selected and run at `K = 5`.
 6. Capture the required BITS Lab screenshots: acquisition/dashboard, ranked search results, and evaluation comparison.
 
-The included corpus has 15 compact research documents, a reproducible citation graph, and 18 graded relevance judgments across five queries. It is intentionally small so that each component is explainable during a lab demo. Add web pages, Crossref results, or a CSV dataset through the UI for a larger experiment.
+## Verification
+
+Run the automated core regression suite before the Virtual Lab demonstration:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The tests rebuild the 15-document corpus in an isolated in-memory database and cover index statistics, Boolean/phrase/negative queries, duplicate and URL validation, standard metric definitions, evaluation comparison, and feedback-aware recommendations.
+
+The included corpus has 15 compact research documents, a reproducible citation graph, and 19 graded relevance judgments across five queries. It is intentionally small so that each component is explainable during a lab demo. Add web pages, Crossref results, or a CSV dataset through the UI for a larger experiment.
 
 ## Input formats
 
@@ -58,8 +68,8 @@ query,url,relevance
 | Text mining | Tokenization, stop-word removal, optional stemming comparison, keyword extraction, rule-based document profile/classification and feature charts |
 | Search | Boolean AND/OR/NOT, quoted phrases, inverted-index candidate filtering, BM25 scoring |
 | Ranking | Iterative PageRank over stored crawl links; user-adjustable BM25/PageRank blend and explanation chart |
-| Recommendation | TF-IDF cosine content recommendations plus feedback-aware hybrid signal; visible Top-K component scores |
-| Evaluation | Precision, Recall, F1, Precision@K, Recall@K, MAP, MRR, NDCG@K; BM25 vs. BM25+PageRank comparison |
+| Recommendation | Configurable Top-K TF-IDF cosine recommendations plus positive/negative feedback and a collaborative hybrid signal; visible component scores |
+| Evaluation | Full-ranking Precision, Recall, F1, MAP and MRR plus Precision@K, Recall@K and NDCG@K; BM25 vs. BM25+PageRank comparison |
 
 ## Project layout
 
@@ -93,5 +103,6 @@ Only crawl sites where collection is permitted. The crawler checks `robots.txt`,
 
 - [x] `app.py`, dependencies, sample dataset and qrels
 - [x] Report with methodology, results and compulsory inferences
+- [x] Automated regression tests for the core IR pipeline
 - [ ] Replace report placeholders with student name/ID and insert BITS Lab screenshots
 - [ ] Run the app in the Virtual Lab and include its screenshots or a short recording

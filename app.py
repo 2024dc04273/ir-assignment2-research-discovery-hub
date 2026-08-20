@@ -65,6 +65,12 @@ def connection() -> sqlite3.Connection:
     ensure_dirs()
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    initialise_database(conn)
+    return conn
+
+
+def initialise_database(conn: sqlite3.Connection) -> None:
+    """Create the local schema; kept separate so core logic is easy to test."""
     conn.executescript(
         """
         PRAGMA foreign_keys = ON;
@@ -99,7 +105,6 @@ def connection() -> sqlite3.Connection:
         """
     )
     conn.commit()
-    return conn
 
 
 def normalise_url(value: str) -> str:
@@ -107,6 +112,10 @@ def normalise_url(value: str) -> str:
     if not parsed.scheme:
         value = "https://" + value
         parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("URL must be an absolute public HTTP(S) URL.")
+    if parsed.username or parsed.password:
+        raise ValueError("URLs containing embedded credentials are not supported.")
     path = parsed.path.rstrip("/") or "/"
     return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, parsed.query, ""))
 
@@ -168,8 +177,11 @@ def is_near_duplicate(conn: sqlite3.Connection, text: str, threshold: float = 0.
 def add_document(conn: sqlite3.Connection, item: dict[str, Any]) -> tuple[str, int | None]:
     raw_text = re.sub(r"\s+", " ", item.get("raw_text", "")).strip()
     title = re.sub(r"\s+", " ", item.get("title", "Untitled document")).strip()
-    url = normalise_url(item.get("url", ""))
-    if not raw_text or len(raw_text) < 30 or not url:
+    try:
+        url = normalise_url(item.get("url", ""))
+    except ValueError:
+        return "invalid_url", None
+    if not raw_text or len(raw_text) < 30:
         return "skipped", None
     content_hash = hashlib.sha256(" ".join(tokenize(raw_text)).encode()).hexdigest()
     if conn.execute("SELECT 1 FROM documents WHERE url = ?", (url,)).fetchone():
@@ -273,41 +285,45 @@ def get_index(conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 def boolean_candidates(query: str, postings: dict[str, dict[str, int]], documents: list[dict[str, Any]]) -> set[int]:
-    """Supports quoted phrases and simple AND / OR / NOT terms as an optimization filter."""
+    """Evaluate phrases and AND/OR/NOT filters (NOT > AND > OR)."""
     all_ids = {doc["doc_id"] for doc in documents}
-    phrases = re.findall(r'"([^"]+)"', query.lower())
-    phrase_hits = {
-        doc["doc_id"] for doc in documents
-        if all(phrase in doc["raw_text"].lower() for phrase in phrases)
-    }
-    remainder = re.sub(r'"[^"]+"', " ", query.lower())
-    tokens = re.findall(r"\b(?:and|or|not)\b|[a-z][a-z0-9_-]*", remainder)
+    tokens = re.findall(r'"[^"]+"|\b(?:AND|OR|NOT)\b|[A-Za-z][A-Za-z0-9_-]*', query,
+                        flags=re.IGNORECASE)
     if not tokens:
-        return phrase_hits if phrases else all_ids
-    groups: list[set[int]] = []
-    current: set[int] | None = None
-    operator = "OR" if "or" in tokens else "AND"
-    negate = False
+        return all_ids
+
+    # Split on OR first. Within each group, adjacent operands and explicit AND
+    # are intersections; NOT complements the following operand.
+    groups: list[list[str]] = [[]]
     for token in tokens:
-        upper = token.upper()
-        if upper in {"AND", "OR"}:
-            operator = upper
-            continue
-        if upper == "NOT":
-            negate = True
-            continue
-        hit = {int(doc_id) for doc_id in postings.get(stem(token), {})}
-        if negate:
-            hit = all_ids - hit
-            negate = False
-        if current is None:
-            current = hit
-        elif operator == "AND":
-            current &= hit
+        if token.upper() == "OR":
+            groups.append([])
         else:
-            current |= hit
-    result = current if current is not None else all_ids
-    return result & phrase_hits if phrases else result
+            groups[-1].append(token)
+
+    result: set[int] = set()
+    for group in groups:
+        current: set[int] | None = None
+        negate = False
+        for token in group:
+            upper = token.upper()
+            if upper == "AND":
+                continue
+            if upper == "NOT":
+                negate = not negate
+                continue
+            if token.startswith('"') and token.endswith('"'):
+                phrase = token[1:-1].lower()
+                hits = {doc["doc_id"] for doc in documents if phrase in doc["raw_text"].lower()}
+            else:
+                hits = {int(doc_id) for doc_id in postings.get(stem(token.lower()), {})}
+            if negate:
+                hits = all_ids - hits
+                negate = False
+            current = hits if current is None else current & hits
+        if current is not None:
+            result |= current
+    return result
 
 
 def search(query: str, conn: sqlite3.Connection, top_k: int = 10, rank_weight: float = 0.20) -> list[dict[str, Any]]:
@@ -316,7 +332,7 @@ def search(query: str, conn: sqlite3.Connection, top_k: int = 10, rank_weight: f
         return []
     index = get_index(conn)
     postings = index["postings"]
-    query_terms = [term for term in tokenize(re.sub(r'"[^"]+"', "", query), use_stemming=True)
+    query_terms = [term for term in tokenize(query, use_stemming=True)
                    if term not in {"and", "or", "not"}]
     candidates = boolean_candidates(query, postings, documents)
     if not candidates:
@@ -337,11 +353,12 @@ def search(query: str, conn: sqlite3.Connection, top_k: int = 10, rank_weight: f
                 continue
             length = int(index["lengths"].get(doc_id_string, 0))
             scores[doc_id] += idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * length / avg_length))
-    # Phrase-only queries should still produce candidate results.
-    if not scores and re.findall(r'"([^"]+)"', query):
-        scores = defaultdict(float, {doc_id: 1.0 for doc_id in candidates})
-    max_bm25 = max(scores.values(), default=1.0)
-    max_pr = max((float(value) for value in index["pagerank"].values()), default=1.0)
+    # Negative-only filters have no positive lexical term to score; retain their
+    # candidates and let PageRank (if enabled) provide a deterministic order.
+    if not scores and candidates:
+        scores = defaultdict(float, {doc_id: 0.0 for doc_id in candidates})
+    max_bm25 = max(scores.values(), default=1.0) or 1.0
+    max_pr = max((float(value) for value in index["pagerank"].values()), default=1.0) or 1.0
     by_id = {doc["doc_id"]: doc for doc in documents}
     results = []
     for doc_id in candidates:
@@ -379,10 +396,16 @@ def recommendations(conn: sqlite3.Connection, selected_id: int, user_id: str, to
     preferred = {row["doc_id"] for row in conn.execute(
         "SELECT doc_id FROM feedback WHERE user_id = ? AND score = 1", (user_id,)
     )}
+    disliked = {row["doc_id"] for row in conn.execute(
+        "SELECT doc_id FROM feedback WHERE user_id = ? AND score = -1", (user_id,)
+    )}
     profile = dict(vectors.get(selected_id, {}))
     for doc_id in preferred - {selected_id}:
         for term, weight in vectors.get(doc_id, {}).items():
             profile[term] = profile.get(term, 0) + 0.35 * weight
+    for doc_id in disliked - {selected_id}:
+        for term, weight in vectors.get(doc_id, {}).items():
+            profile[term] = profile.get(term, 0) - 0.20 * weight
     profile_norm = math.sqrt(sum(value * value for value in profile.values())) or 1
     profile = {term: value / profile_norm for term, value in profile.items()}
     # A lightweight collaborative signal: co-likes by demo/session users if they exist.
@@ -395,9 +418,9 @@ def recommendations(conn: sqlite3.Connection, selected_id: int, user_id: str, to
     values = []
     for doc in docs:
         doc_id = doc["doc_id"]
-        if doc_id == selected_id:
+        if doc_id == selected_id or doc_id in disliked:
             continue
-        content_score = cosine(profile, vectors.get(doc_id, {}))
+        content_score = max(0.0, cosine(profile, vectors.get(doc_id, {})))
         collaborative_score = co_like[doc_id] / collaborative_max if collaborative_max else 0.0
         hybrid = 0.8 * content_score + 0.2 * collaborative_score
         row = dict(doc)
@@ -437,15 +460,35 @@ def fetch_crossref(query: str, rows: int) -> list[dict[str, Any]]:
     return items
 
 
+def safe_get(url: str, *, timeout: int, max_redirects: int = 3) -> requests.Response:
+    """Fetch an HTTP(S) URL while revalidating every redirect target."""
+    current = normalise_url(url)
+    for _ in range(max_redirects + 1):
+        if not is_safe_public_url(current):
+            raise requests.RequestException(f"blocked non-public or invalid URL: {current}")
+        response = requests.get(current, headers={"User-Agent": USER_AGENT}, timeout=timeout,
+                                allow_redirects=False)
+        if response.status_code not in {301, 302, 303, 307, 308}:
+            return response
+        location = response.headers.get("Location")
+        if not location:
+            return response
+        current = normalise_url(urllib.parse.urljoin(current, location))
+    raise requests.TooManyRedirects(f"more than {max_redirects} redirects for {url}")
+
+
 def can_fetch(url: str) -> bool:
     parsed = urllib.parse.urlsplit(url)
     robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
     try:
         parser = urllib.robotparser.RobotFileParser()
+        response = safe_get(robots_url, timeout=10)
+        if response.status_code >= 400:
+            return True
         parser.set_url(robots_url)
-        parser.read()
+        parser.parse(response.text.splitlines())
         return parser.can_fetch(USER_AGENT, url)
-    except Exception:
+    except (requests.RequestException, ValueError):
         # A failed robots retrieval should not silently block a permitted manual seed.
         return True
 
@@ -466,10 +509,17 @@ def is_safe_public_url(url: str) -> bool:
 
 
 def crawl(seeds: list[str], depth: int, limit: int, status: Any) -> tuple[list[dict[str, Any]], list[str]]:
-    queue = deque((normalise_url(seed), 0) for seed in seeds if seed.strip())
+    queue: deque[tuple[str, int]] = deque()
+    warnings: list[str] = []
+    for seed in seeds:
+        if not seed.strip():
+            continue
+        try:
+            queue.append((normalise_url(seed), 0))
+        except ValueError:
+            warnings.append(f"invalid seed URL: {seed.strip()}")
     seen: set[str] = set()
     items: list[dict[str, Any]] = []
-    warnings: list[str] = []
     while queue and len(items) < limit:
         url, current_depth = queue.popleft()
         if url in seen:
@@ -482,7 +532,7 @@ def crawl(seeds: list[str], depth: int, limit: int, status: Any) -> tuple[list[d
             warnings.append(f"robots.txt disallowed: {url}")
             continue
         try:
-            response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=15)
+            response = safe_get(url, timeout=15)
             response.raise_for_status()
             if "text/html" not in response.headers.get("Content-Type", ""):
                 warnings.append(f"not HTML: {url}")
@@ -514,36 +564,42 @@ def crawl(seeds: list[str], depth: int, limit: int, status: Any) -> tuple[list[d
 
 def metrics_for_ranking(ranked: list[str], relevance: dict[str, float], k: int) -> dict[str, float]:
     total_relevant = sum(value > 0 for value in relevance.values())
-    retrieved = ranked[:k]
-    binary = [1 if relevance.get(doc_id, 0) > 0 else 0 for doc_id in retrieved]
-    relevant_retrieved = sum(binary)
-    precision = relevant_retrieved / len(retrieved) if retrieved else 0.0
+    binary_all = [1 if relevance.get(doc_id, 0) > 0 else 0 for doc_id in ranked]
+    binary_at_k = binary_all[:k]
+    relevant_retrieved = sum(binary_all)
+    relevant_at_k = sum(binary_at_k)
+    precision = relevant_retrieved / len(ranked) if ranked else 0.0
     recall = relevant_retrieved / total_relevant if total_relevant else 0.0
     f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
     ap_parts, relevant_seen = [], 0
-    for position, is_relevant in enumerate(binary, start=1):
+    for position, is_relevant in enumerate(binary_all, start=1):
         if is_relevant:
             relevant_seen += 1
             ap_parts.append(relevant_seen / position)
     ap = sum(ap_parts) / total_relevant if total_relevant else 0.0
-    rr = next((1 / position for position, is_relevant in enumerate(binary, 1) if is_relevant), 0.0)
+    rr = next((1 / position for position, is_relevant in enumerate(binary_all, 1) if is_relevant), 0.0)
+    retrieved = ranked[:k]
     dcg = sum((2 ** relevance.get(doc_id, 0) - 1) / math.log2(position + 1)
               for position, doc_id in enumerate(retrieved, 1))
     ideal = sorted(relevance.values(), reverse=True)[:k]
     idcg = sum((2 ** value - 1) / math.log2(position + 1) for position, value in enumerate(ideal, 1))
-    return {"Precision": precision, "Recall": recall, "F1": f1, "Precision@K": precision,
-            "Recall@K": recall, "AP": ap, "MRR": rr, "NDCG@K": dcg / idcg if idcg else 0.0}
+    return {"Precision": precision, "Recall": recall, "F1": f1,
+            "Precision@K": relevant_at_k / k if k else 0.0,
+            "Recall@K": relevant_at_k / total_relevant if total_relevant else 0.0,
+            "AP": ap, "MRR": rr, "NDCG@K": dcg / idcg if idcg else 0.0}
 
 
 def evaluation_table(conn: sqlite3.Connection, qrels: pd.DataFrame, k: int) -> tuple[pd.DataFrame, pd.DataFrame]:
     required = {"query", "url", "relevance"}
     if not required.issubset(qrels.columns):
         raise ValueError("Qrels CSV must contain query, url, relevance.")
+    document_count = int(conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
     per_query = []
     for query, group in qrels.groupby("query"):
         relevance = {normalise_url(row.url): float(row.relevance) for row in group.itertuples()}
         for strategy, weight in (("BM25", 0.0), ("BM25 + PageRank", 0.20)):
-            ranked = [item["url"] for item in search(str(query), conn, top_k=k, rank_weight=weight)]
+            ranked = [item["url"] for item in search(str(query), conn, top_k=document_count,
+                                                      rank_weight=weight)]
             value = metrics_for_ranking(ranked, relevance, k)
             per_query.append({"Query": query, "Strategy": strategy, **value})
     detailed = pd.DataFrame(per_query)
@@ -689,7 +745,8 @@ def index_management(conn: sqlite3.Connection) -> None:
         if st.button("Rebuild inverted index", type="primary"):
             index = build_index(conn)
             st.success(f"Rebuilt index with {len(index['postings'])} terms.")
-        if st.button("Clear all corpus data"):
+        confirm_clear = st.checkbox("Confirm permanent removal of the local corpus")
+        if st.button("Clear all corpus data", disabled=not confirm_clear):
             conn.execute("DELETE FROM feedback")
             conn.execute("DELETE FROM links")
             conn.execute("DELETE FROM documents")
@@ -745,6 +802,8 @@ def recommendation_page(conn: sqlite3.Connection) -> None:
     labels = {f"{doc['doc_id']} — {doc['title'][:80]}": doc["doc_id"] for doc in docs}
     selected_label = st.selectbox("Document used as the recommendation seed", list(labels))
     selected_id = labels[selected_label]
+    max_k = min(15, len(docs) - 1)
+    top_k = st.slider("Number of recommendations (K)", 1, max_k, min(5, max_k))
     rating = st.radio("Your feedback on this document", ["No preference", "Relevant / save", "Not relevant"], horizontal=True)
     if st.button("Record feedback"):
         score = {"Relevant / save": 1, "Not relevant": -1}.get(rating)
@@ -755,8 +814,8 @@ def recommendation_page(conn: sqlite3.Connection) -> None:
                          (st.session_state.user_id, selected_id, score, datetime.now(timezone.utc).isoformat()))
         conn.commit()
         st.success("Feedback saved for this session.")
-    values = recommendations(conn, selected_id, st.session_state.user_id)
-    st.caption("Hybrid score = 80% TF-IDF cosine content similarity (including saved-item profile) + 20% collaborative co-like signal when multiple user profiles are available.")
+    values = recommendations(conn, selected_id, st.session_state.user_id, top_k)
+    st.caption("Hybrid score = 80% TF-IDF cosine content similarity (including saved and disliked-item feedback) + 20% collaborative co-like signal when multiple user profiles are available. Items marked not relevant are excluded.")
     table = pd.DataFrame(values)[["doc_id", "title", "category", "content_similarity", "collaborative_signal", "hybrid_score"]]
     st.dataframe(table, width="stretch", hide_index=True)
     if values:

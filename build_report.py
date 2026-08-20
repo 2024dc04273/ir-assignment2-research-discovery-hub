@@ -58,6 +58,20 @@ def shade(cell, color: str) -> None:
     tc_pr.append(shd)
 
 
+def shade_paragraph(paragraph, color: str) -> None:
+    paragraph_properties = paragraph._p.get_or_add_pPr()
+    shading = OxmlElement("w:shd")
+    shading.set(qn("w:fill"), color)
+    paragraph_properties.append(shading)
+
+
+def mark_header_row(row) -> None:
+    table_row_properties = row._tr.get_or_add_trPr()
+    header = OxmlElement("w:tblHeader")
+    header.set(qn("w:val"), "true")
+    table_row_properties.append(header)
+
+
 def set_table_geometry(table, widths: list[int], header_fill: str | None = LIGHT_GRAY) -> None:
     table.alignment = WD_TABLE_ALIGNMENT.LEFT
     table.autofit = False
@@ -83,6 +97,8 @@ def set_table_geometry(table, widths: list[int], header_fill: str | None = LIGHT
     for grid_col, width in zip(grid.gridCol_lst, widths):
         grid_col.set(qn("w:w"), str(width))
     for row_index, row in enumerate(table.rows):
+        if row_index == 0 and header_fill:
+            mark_header_row(row)
         for col_index, cell in enumerate(row.cells):
             cell.width = Inches(widths[col_index] / 1440)
             tc_pr = cell._tc.get_or_add_tcPr()
@@ -172,12 +188,12 @@ def add_paragraph(doc: Document, text: str, lead: str | None = None) -> None:
 
 
 def add_note(doc: Document, title: str, text: str) -> None:
-    table = doc.add_table(rows=1, cols=1)
-    set_table_geometry(table, [TABLE_WIDTH], header_fill=None)
-    cell = table.cell(0, 0)
-    shade(cell, CALL_OUT)
-    paragraph = cell.paragraphs[0]
-    paragraph.paragraph_format.space_after = Pt(0)
+    paragraph = doc.add_paragraph()
+    shade_paragraph(paragraph, CALL_OUT)
+    paragraph.paragraph_format.left_indent = Inches(0.08)
+    paragraph.paragraph_format.right_indent = Inches(0.08)
+    paragraph.paragraph_format.space_before = Pt(5)
+    paragraph.paragraph_format.space_after = Pt(5)
     run = paragraph.add_run(f"{title}: ")
     set_run_font(run, 10.5, INK, bold=True)
     run = paragraph.add_run(text)
@@ -223,11 +239,11 @@ def build() -> None:
               [
                   ["Streamlit workflow", "Dashboard, acquisition, index management, search/ranking, recommendation, evaluation, mining and analytics pages."],
                   ["Heterogeneous acquisition", "CSV upload, Crossref public API and robots-aware multi-seed HTML crawling."],
-                  ["Crawling + duplicates", "Configurable depth/page limit; normalized URLs, SHA-256 content hashes and trigram-shingle Jaccard near-duplicate detection."],
+                  ["Crawling + duplicates", "Configurable depth/page limit; public-URL and redirect validation; normalized URLs, SHA-256 content hashes and trigram-shingle Jaccard near-duplicate detection."],
                   ["Text mining", "Tokenization, stop-word removal, stemming comparison, keyword extraction, document category/profile and feature-distribution charts."],
                   ["Search and ranking", "Phrase/AND/OR/NOT filtering, inverted-index candidates, BM25, iterative PageRank and an adjustable blend explanation chart."],
-                  ["Recommendation", "TF-IDF cosine Top-K content scores plus an optional feedback-aware hybrid component."],
-                  ["Evaluation", "Precision, Recall, F1, P@K, R@K, MAP, MRR and NDCG@K, reported for BM25 and BM25 + PageRank."],
+                  ["Recommendation", "Configurable Top-K TF-IDF cosine scores plus positive/negative feedback and an optional collaborative hybrid component."],
+                  ["Evaluation", "Full-ranking Precision, Recall, F1, MAP and MRR plus P@K, R@K and NDCG@K, reported for BM25 and BM25 + PageRank."],
               ], [2700, 6660])
 
     doc.add_heading("4. Corpus and experimental method", level=1)
@@ -239,10 +255,10 @@ def build() -> None:
     add_table(doc,
               ["Strategy", "P@5", "R@5", "F1", "MAP", "MRR", "NDCG@5"],
               [
-                  ["BM25", "0.853", "0.530", "0.614", "0.508", "1.000", "0.739"],
-                  ["BM25 + PageRank", "0.893", "0.580", "0.659", "0.548", "1.000", "0.790"],
+                  ["BM25", "0.400", "0.530", "0.626", "0.536", "1.000", "0.739"],
+                  ["BM25 + PageRank", "0.440", "0.580", "0.626", "0.548", "1.000", "0.790"],
               ], [2520, 1140, 1140, 1140, 1140, 1140, 1140])
-    add_paragraph(doc, "The PageRank blend improves the compact demonstration set on P@5 (+0.040), R@5 (+0.050), MAP (+0.040) and NDCG@5 (+0.051). It does not alter MRR because the first relevant result was already first in the evaluated queries. This is a useful result: authority signals help ordering and coverage, but should complement rather than replace lexical relevance.")
+    add_paragraph(doc, "The PageRank blend improves the compact demonstration set on P@5 (+0.040), R@5 (+0.050), MAP (+0.011) and NDCG@5 (+0.051). Full-ranking Precision, Recall and F1 are unchanged because both strategies retrieve the same candidate sets; PageRank changes their order. MRR is also unchanged because the first relevant result was already first. This is a useful result: authority signals improve early ordering and coverage, but complement rather than replace lexical relevance.")
     add_table(doc,
               ["Query: ranking", "P@5", "R@5", "MRR", "NDCG@5"],
               [
@@ -261,7 +277,7 @@ def build() -> None:
     doc.add_heading("6.4 Value of the integrated lifecycle", level=2)
     add_paragraph(doc, "Each lifecycle stage protects the next. Responsible crawling and API/CSV acquisition improve coverage; deduplication improves collection quality; preprocessing and indexing make search efficient; ranking orders candidates by relevance and authority; recommendation extends discovery beyond an explicit query; and evaluation turns user-visible behavior into measurable evidence. Keeping these stages in one Streamlit workflow makes failures traceable—for example, a poor result can be investigated through its source, preprocessing, term vocabulary, BM25 score, PageRank value and relevance judgment.")
     doc.add_heading("6.5 Learnings from the experiment", level=2)
-    add_paragraph(doc, "The work shows that a good IR system is not a single algorithm. The baseline BM25 index provides a strong transparent starting point, but authority features changed the rank quality for the diagnostic query. The preprocessing comparison shows why feature choices control both vocabulary size and matching behavior. The duplicate checks and separate metadata/content storage improve reliability before a ranking model runs. Finally, the metric dashboard prevents overclaiming: the PageRank blend improved NDCG and recall in this small curated collection, but it must be retested on a larger, independently judged corpus before treating it as a general conclusion.")
+    add_paragraph(doc, "The work shows that a good IR system is not a single algorithm. The baseline BM25 index provides a strong transparent starting point, but authority features changed the rank quality for the diagnostic query. The preprocessing comparison shows why feature choices control both vocabulary size and matching behavior. The duplicate checks and separate metadata/content storage improve reliability before a ranking model runs. Finally, the metric dashboard prevents overclaiming: the PageRank blend improved NDCG@5 and Recall@5 in this small curated collection, but it must be retested on a larger, independently judged corpus before treating it as a general conclusion.")
 
     doc.add_heading("7. Virtual Lab demonstration evidence", level=1)
     add_note(doc, "Student action required", "Run the app on the BITS Virtual Lab and replace the three placeholders below with your own screenshots. They cannot be truthfully generated outside your Virtual Lab session.")
@@ -270,21 +286,20 @@ def build() -> None:
         "Screenshot 2 — Search & Ranking for `ranking`. Show the BM25, PageRank and final scores with PageRank influence at 0.20.",
         "Screenshot 3 — Evaluation Dashboard at K = 5. Show the BM25 versus BM25 + PageRank metric table and chart.",
     ):
-        table = doc.add_table(rows=1, cols=1)
-        set_table_geometry(table, [TABLE_WIDTH], header_fill=None)
-        cell = table.cell(0, 0)
-        shade(cell, "FAFAFA")
-        paragraph = cell.paragraphs[0]
+        paragraph = doc.add_paragraph()
+        shade_paragraph(paragraph, "FAFAFA")
         paragraph.paragraph_format.space_before = Pt(18)
         paragraph.paragraph_format.space_after = Pt(18)
+        paragraph.paragraph_format.left_indent = Inches(0.12)
+        paragraph.paragraph_format.right_indent = Inches(0.12)
         paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = paragraph.add_run(caption + "\n[Insert Virtual Lab screenshot here]")
         set_run_font(run, 10.5, MUTED, italic=True)
         doc.add_paragraph().paragraph_format.space_after = Pt(3)
 
     doc.add_heading("8. Execution instructions", level=1)
-    add_paragraph(doc, "Create a virtual environment, install requirements, and run `streamlit run app.py`. The README lists every step and the required CSV schemas. For the demonstration, use the supplied data/sample_documents.csv and data/sample_qrels.csv or add a permitted domain/API/CSV collection through the acquisition page. No command other than starting Streamlit is needed for the normal front-end workflow.")
-    add_note(doc, "Submission contents", "Submit app.py, requirements.txt, data/sample_documents.csv, data/sample_qrels.csv, README.md, this report after filling student details and screenshots, plus any additional dataset material used in your own run.")
+    add_paragraph(doc, "Create a virtual environment, install requirements, and run `streamlit run app.py`. The README lists every step and the required CSV schemas. For the demonstration, use the supplied data/sample_documents.csv and data/sample_qrels.csv or add a permitted domain/API/CSV collection through the acquisition page. No command other than starting Streamlit is needed for the normal front-end workflow. Before submission, run `python -m unittest discover -s tests -v` to verify the core pipeline.")
+    add_note(doc, "Submission contents", "Submit app.py, requirements.txt, the tests folder, data/sample_documents.csv, data/sample_qrels.csv, README.md, this report after filling student details and screenshots, plus any additional dataset material used in your own run.")
 
     doc.save(OUT)
     print(OUT)
